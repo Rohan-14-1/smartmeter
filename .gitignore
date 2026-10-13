@@ -1,0 +1,14 @@
+# Large data files (>100MB exceeds GitHub push limit, downloaded automatically via prepare_data.py)
+data.csv
+household_power_consumption.zip
+
+# Python & Environment
+__pycache__/
+*.pyc
+.venv/
+venv/
+env/
+
+# OS specific
+.DS_Store
+Thumbs.db

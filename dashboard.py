@@ -160,6 +160,7 @@ st.markdown("""
 import sqlite3
 import csv
 import threading
+import joblib
 
 # ── Database Connection ───────────────────────────────────────────────
 def get_db():
@@ -186,7 +187,7 @@ def get_db():
     except Exception:
         # Resilient SQLite fallback (ensures zero crash on Streamlit Cloud)
         sqlite_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smartmeter_cloud.db")
-        c = sqlite3.connect(sqlite_path, check_same_thread=False)
+        c = sqlite3.connect(sqlite_path, check_same_thread=False, timeout=15.0)
         return c, "sqlite"
 
 conn, db_type = get_db()
@@ -235,6 +236,62 @@ else:
             );
         """)
 
+# ── Streaming Control Flag (Thread-Safe & Cross-Session) ─────────────
+BASE_DIR = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+STREAM_FLAG_FILE = os.path.join(BASE_DIR, ".streaming_active")
+
+# Auto-seed initial 60 readings if DB is completely empty (guarantees instant visual dashboard)
+try:
+    check_cnt = pd.read_sql("SELECT COUNT(*) AS c FROM meter_readings", conn)
+    if check_cnt.empty or int(check_cnt.iloc[0]["c"]) == 0:
+        csv_file_seed = os.path.join(BASE_DIR, "data.csv")
+        if not os.path.exists(csv_file_seed):
+            csv_file_seed = os.path.join(BASE_DIR, "data_sample.csv")
+        model_p = os.path.join(BASE_DIR, "anomaly_model.pkl")
+        seed_model = None
+        if os.path.exists(model_p):
+            try:
+                seed_model = joblib.load(model_p)
+            except Exception:
+                pass
+
+        from collections import deque
+        s_win = deque(maxlen=30)
+        s_peak, s_kwh, s_anom = 0.0, 0.0, 0
+        with open(csv_file_seed) as f:
+            for s_idx, s_r in enumerate(csv.DictReader(f)):
+                if s_idx >= 60:
+                    break
+                p_val = float(s_r["Global_active_power"])
+                s_win.append(p_val)
+                s_avg = sum(s_win) / len(s_win)
+                s_peak = max(s_peak, p_val)
+                s_kwh += p_val / 60.0
+                if seed_model is not None:
+                    try:
+                        is_a = int(seed_model.predict([[p_val]])[0] == -1)
+                    except Exception:
+                        is_a = int(p_val > 4.862)
+                else:
+                    is_a = int(p_val > 4.862)
+                s_anom += is_a
+                t_str = s_r.get("Date_Time", "2006-12-16 17:24:00")
+
+                if db_type == "postgres":
+                    with conn.cursor() as cur:
+                        cur.execute("INSERT INTO meter_readings (reading_time, global_active_power, rolling_avg_30, is_anomaly) VALUES (%s,%s,%s,%s)", (t_str, p_val, round(s_avg, 3), is_a))
+                        cur.execute("INSERT INTO meter_metrics VALUES (1,%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET current_power=EXCLUDED.current_power, rolling_avg=EXCLUDED.rolling_avg, peak_power=EXCLUDED.peak_power, total_kwh=EXCLUDED.total_kwh, anomaly_count=EXCLUDED.anomaly_count", (p_val, round(s_avg, 3), s_peak, round(s_kwh, 3), s_anom))
+                        conn.commit()
+                else:
+                    with conn:
+                        conn.execute("INSERT INTO meter_readings (reading_time, global_active_power, rolling_avg_30, is_anomaly) VALUES (?,?,?,?)", (t_str, p_val, round(s_avg, 3), is_a))
+                        conn.execute("INSERT OR REPLACE INTO meter_metrics (id, current_power, rolling_avg, peak_power, total_kwh, anomaly_count) VALUES (1,?,?,?,?,?)", (p_val, round(s_avg, 3), s_peak, round(s_kwh, 3), s_anom))
+
+        # Enable streaming by default so cloud visitors see the live curve immediately
+        open(STREAM_FLAG_FILE, "w").close()
+except Exception:
+    pass
+
 # ── Check Pipeline Process Status ─────────────────────────────────────
 def is_process_running(script_name: str) -> bool:
     try:
@@ -243,57 +300,89 @@ def is_process_running(script_name: str) -> bool:
     except Exception:
         return False
 
-# Global stream flag for cloud mode
-if "cloud_stream_active" not in st.session_state:
-    st.session_state["cloud_stream_active"] = False
+cloud_stream_on = os.path.exists(STREAM_FLAG_FILE)
+processor_active = is_process_running("processor.py") or cloud_stream_on
+producer_active = is_process_running("producer.py") or cloud_stream_on
 
-processor_active = is_process_running("processor.py") or st.session_state.get("cloud_stream_active", False)
-producer_active = is_process_running("producer.py") or st.session_state.get("cloud_stream_active", False)
-
+# Background Cloud Streamer Worker (No session_state dependencies)
 def run_cloud_streamer():
-    base_dir = os.path.dirname(os.path.abspath(__file__))
-    csv_file = os.path.join(base_dir, "data.csv")
+    csv_file = os.path.join(BASE_DIR, "data.csv")
     if not os.path.exists(csv_file):
-        csv_file = os.path.join(base_dir, "data_sample.csv")
+        csv_file = os.path.join(BASE_DIR, "data_sample.csv")
     if not os.path.exists(csv_file):
         return
 
-    model_path = os.path.join(base_dir, "anomaly_model.pkl")
-    model = joblib.load(model_path) if os.path.exists(model_path) else None
+    model_path = os.path.join(BASE_DIR, "anomaly_model.pkl")
+    model = None
+    if os.path.exists(model_path):
+        try:
+            model = joblib.load(model_path)
+        except Exception:
+            pass
 
     from collections import deque
     window = deque(maxlen=30)
-    peak, total_kwh, anomaly_count = 0.0, 0.0, 0
-
     c_stream, d_type = get_db()
-    with open(csv_file) as f:
-        for row in csv.DictReader(f):
-            if not st.session_state.get("cloud_stream_active", False):
-                break
-            try:
-                p = float(row["Global_active_power"])
-            except Exception:
-                continue
 
-            window.append(p)
-            avg = sum(window) / len(window)
-            peak = max(peak, p)
-            total_kwh += p / 60.0
-            is_anom = int(model.predict([[p]])[0] == -1) if model else 0
-            anomaly_count += is_anom
-            t_val = row.get("Date_Time", "2006-12-16 17:24:00")
+    # Get baseline aggregates
+    try:
+        curr_m = pd.read_sql("SELECT * FROM meter_metrics WHERE id=1", c_stream)
+        if not curr_m.empty:
+            peak = float(curr_m.iloc[0]["peak_power"]) if pd.notnull(curr_m.iloc[0]["peak_power"]) else 0.0
+            total_kwh = float(curr_m.iloc[0]["total_kwh"]) if pd.notnull(curr_m.iloc[0]["total_kwh"]) else 0.0
+            anomaly_count = int(curr_m.iloc[0]["anomaly_count"]) if pd.notnull(curr_m.iloc[0]["anomaly_count"]) else 0
+        else:
+            peak, total_kwh, anomaly_count = 0.0, 0.0, 0
+    except Exception:
+        peak, total_kwh, anomaly_count = 0.0, 0.0, 0
 
-            if d_type == "postgres":
-                with c_stream.cursor() as cur:
-                    cur.execute("INSERT INTO meter_readings (reading_time, global_active_power, rolling_avg_30, is_anomaly) VALUES (%s,%s,%s,%s)", (t_val, p, round(avg, 3), is_anom))
-                    cur.execute("INSERT INTO meter_metrics VALUES (1,%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET current_power=EXCLUDED.current_power, rolling_avg=EXCLUDED.rolling_avg, peak_power=EXCLUDED.peak_power, total_kwh=EXCLUDED.total_kwh, anomaly_count=EXCLUDED.anomaly_count", (p, round(avg, 3), peak, round(total_kwh, 3), anomaly_count))
-                    c_stream.commit()
-            else:
-                with c_stream:
-                    c_stream.execute("INSERT INTO meter_readings (reading_time, global_active_power, rolling_avg_30, is_anomaly) VALUES (?,?,?,?)", (t_val, p, round(avg, 3), is_anom))
-                    c_stream.execute("INSERT OR REPLACE INTO meter_metrics (id, current_power, rolling_avg, peak_power, total_kwh, anomaly_count) VALUES (1,?,?,?,?,?)", (p, round(avg, 3), peak, round(total_kwh, 3), anomaly_count))
+    while os.path.exists(STREAM_FLAG_FILE):
+        with open(csv_file) as f:
+            reader = csv.DictReader(f)
+            # Skip first 60 already seeded
+            for _ in range(60):
+                next(reader, None)
 
-            time.sleep(0.12)
+            for row in reader:
+                if not os.path.exists(STREAM_FLAG_FILE):
+                    break
+                try:
+                    p = float(row["Global_active_power"])
+                except Exception:
+                    continue
+
+                window.append(p)
+                avg = sum(window) / len(window)
+                peak = max(peak, p)
+                total_kwh += p / 60.0
+                if model is not None:
+                    try:
+                        is_anom = int(model.predict([[p]])[0] == -1)
+                    except Exception:
+                        is_anom = int(p > 4.862)
+                else:
+                    is_anom = int(p > 4.862)
+                anomaly_count += is_anom
+                t_val = row.get("Date_Time", "2006-12-16 17:24:00")
+
+                if d_type == "postgres":
+                    with c_stream.cursor() as cur:
+                        cur.execute("INSERT INTO meter_readings (reading_time, global_active_power, rolling_avg_30, is_anomaly) VALUES (%s,%s,%s,%s)", (t_val, p, round(avg, 3), is_anom))
+                        cur.execute("INSERT INTO meter_metrics VALUES (1,%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET current_power=EXCLUDED.current_power, rolling_avg=EXCLUDED.rolling_avg, peak_power=EXCLUDED.peak_power, total_kwh=EXCLUDED.total_kwh, anomaly_count=EXCLUDED.anomaly_count", (p, round(avg, 3), peak, round(total_kwh, 3), anomaly_count))
+                        c_stream.commit()
+                else:
+                    with c_stream:
+                        c_stream.execute("INSERT INTO meter_readings (reading_time, global_active_power, rolling_avg_30, is_anomaly) VALUES (?,?,?,?)", (t_val, p, round(avg, 3), is_anom))
+                        c_stream.execute("INSERT OR REPLACE INTO meter_metrics (id, current_power, rolling_avg, peak_power, total_kwh, anomaly_count) VALUES (1,?,?,?,?,?)", (p, round(avg, 3), peak, round(total_kwh, 3), anomaly_count))
+
+                time.sleep(0.25)
+
+# Ensure cloud streamer thread is running if flag is set
+if cloud_stream_on and not is_process_running("processor.py"):
+    thread_names = [t.name for t in threading.enumerate()]
+    if "CloudStreamerThread" not in thread_names:
+        t = threading.Thread(target=run_cloud_streamer, name="CloudStreamerThread", daemon=True)
+        t.start()
 
 # ── Sidebar Controls ──────────────────────────────────────────────────
 with st.sidebar:
@@ -319,12 +408,9 @@ with st.sidebar:
         unsafe_allow_html=True
     )
 
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
         if st.button("▶ Start Stream", width="stretch", type="primary"):
-            # Check if Kafka is reachable
             import socket
             kafka_up = False
             try:
@@ -337,39 +423,50 @@ with st.sidebar:
             if kafka_up:
                 if not is_process_running("processor.py"):
                     subprocess.Popen(
-                        [sys.executable, os.path.join(script_dir, "processor.py")],
-                        cwd=script_dir,
+                        [sys.executable, os.path.join(BASE_DIR, "processor.py")],
+                        cwd=BASE_DIR,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL
                     )
                     time.sleep(0.5)
                 if not is_process_running("producer.py"):
                     subprocess.Popen(
-                        [sys.executable, os.path.join(script_dir, "producer.py"), "--delay", "0.08"],
-                        cwd=script_dir,
+                        [sys.executable, os.path.join(BASE_DIR, "producer.py"), "--delay", "0.08"],
+                        cwd=BASE_DIR,
                         stdout=subprocess.DEVNULL,
                         stderr=subprocess.DEVNULL
                     )
             else:
-                # Cloud Streamer thread for Streamlit Cloud
-                st.session_state["cloud_stream_active"] = True
-                t = threading.Thread(target=run_cloud_streamer, daemon=True)
-                t.start()
+                # Set streaming flag and launch background thread
+                open(STREAM_FLAG_FILE, "w").close()
+                thread_names = [t.name for t in threading.enumerate()]
+                if "CloudStreamerThread" not in thread_names:
+                    t = threading.Thread(target=run_cloud_streamer, name="CloudStreamerThread", daemon=True)
+                    t.start()
 
             st.success("Pipeline started!")
-            time.sleep(1)
+            time.sleep(0.5)
             st.rerun()
 
     with col_btn2:
         if st.button("⏹ Stop Stream", width="stretch"):
-            st.session_state["cloud_stream_active"] = False
+            if os.path.exists(STREAM_FLAG_FILE):
+                try:
+                    os.remove(STREAM_FLAG_FILE)
+                except Exception:
+                    pass
             os.system("pkill -f 'processor.py'")
             os.system("pkill -f 'producer.py'")
             st.warning("Stream paused.")
-            time.sleep(1)
+            time.sleep(0.5)
             st.rerun()
 
     if st.button("🗑️ Reset Tables to 0", width="stretch"):
+        if os.path.exists(STREAM_FLAG_FILE):
+            try:
+                os.remove(STREAM_FLAG_FILE)
+            except Exception:
+                pass
         if db_type == "postgres":
             with conn.cursor() as cur:
                 cur.execute("TRUNCATE TABLE meter_readings RESTART IDENTITY;")

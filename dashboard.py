@@ -465,7 +465,7 @@ if not recent_df.empty:
     )
 
     st.markdown("### 📈 Real-Time Power Telemetry Stream")
-    st.plotly_chart(fig, use_container_width=True)
+    st.plotly_chart(fig, width="stretch")
 
     # ── Lower Split: Recent Anomalies Table & Summary ─────────────────
     row2_col1, row2_col2 = st.columns([3, 2])
@@ -485,7 +485,7 @@ if not recent_df.empty:
                     "rolling_avg_30": "Rolling Avg (kW)",
                     "Deviation": "Surge Delta (kW)"
                 }),
-                use_container_width=True,
+                width="stretch",
                 hide_index=True
             )
         else:

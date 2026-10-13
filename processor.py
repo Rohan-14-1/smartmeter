@@ -46,7 +46,13 @@ def main():
 
     # Connect to PostgreSQL
     print("🗄️   Connecting to PostgreSQL …")
-    db = psycopg2.connect(**DB_CONFIG)
+    db_url = os.environ.get("DATABASE_URL")
+    if db_url:
+        if db_url.startswith("postgres://"):
+            db_url = db_url.replace("postgres://", "postgresql://", 1)
+        db = psycopg2.connect(db_url)
+    else:
+        db = psycopg2.connect(**DB_CONFIG)
     db.autocommit = True
     cur = db.cursor()
     cur.execute("SET datestyle = 'DMY';")

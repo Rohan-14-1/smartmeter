@@ -1,0 +1,16 @@
+# Exclude large local data and archive
+data.csv
+household_power_consumption.zip
+
+# Python cache & virtual environment
+__pycache__
+*.pyc
+*.pyo
+.venv
+venv
+env
+
+# Git & OS
+.git
+.gitignore
+.DS_Store

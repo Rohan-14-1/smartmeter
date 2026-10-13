@@ -18,6 +18,8 @@ from kafka import KafkaProducer
 
 DATA_DIR = os.path.dirname(os.path.abspath(__file__))
 CSV_PATH = os.path.join(DATA_DIR, "data.csv")
+if not os.path.exists(CSV_PATH):
+    CSV_PATH = os.path.join(DATA_DIR, "data_sample.csv")
 
 KAFKA_BROKER = "127.0.0.1:9092"
 TOPIC = "smartmeter-events"

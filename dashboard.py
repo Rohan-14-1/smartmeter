@@ -158,18 +158,47 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ── Database Connection ───────────────────────────────────────────────
-DB_CONFIG = dict(
-    host="localhost",
-    user="meter_app",
-    password="meter_pass",
-    dbname="smartmeter",
-)
+def get_db():
+    db_url = os.environ.get("DATABASE_URL")
+    if db_url:
+        if db_url.startswith("postgres://"):
+            db_url = db_url.replace("postgres://", "postgresql://", 1)
+        return psycopg2.connect(db_url)
+    
+    DB_CONFIG = dict(
+        host=os.environ.get("DB_HOST", "localhost"),
+        user=os.environ.get("DB_USER", "meter_app"),
+        password=os.environ.get("DB_PASS", "meter_pass"),
+        dbname=os.environ.get("DB_NAME", "smartmeter"),
+        port=os.environ.get("DB_PORT", "5432"),
+    )
+    return psycopg2.connect(**DB_CONFIG)
 
 try:
-    conn = psycopg2.connect(**DB_CONFIG)
-except psycopg2.Error as err:
+    conn = get_db()
+    with conn.cursor() as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS meter_readings (
+                reading_pk BIGSERIAL PRIMARY KEY,
+                reading_time TIMESTAMP,
+                global_active_power NUMERIC(10,3),
+                rolling_avg_30 NUMERIC(10,3),
+                is_anomaly SMALLINT DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_readings_pk ON meter_readings (reading_pk DESC);
+            CREATE TABLE IF NOT EXISTS meter_metrics (
+                id INT PRIMARY KEY,
+                current_power NUMERIC(10,3),
+                rolling_avg NUMERIC(10,3),
+                peak_power NUMERIC(10,3),
+                total_kwh NUMERIC(12,3),
+                anomaly_count INT
+            );
+        """)
+        conn.commit()
+except Exception as err:
     st.error(f"⚠️ Could not connect to PostgreSQL: {err}")
-    st.info("Make sure PostgreSQL is running: `brew services start postgresql@14` (or your active version).")
+    st.info("Check your database connection or configure DATABASE_URL in Render environment variables.")
     st.stop()
 
 # ── Check Pipeline Process Status ─────────────────────────────────────
@@ -211,7 +240,7 @@ with st.sidebar:
 
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
-        if st.button("▶ Start Stream", use_container_width=True, type="primary"):
+        if st.button("▶ Start Stream", width="stretch", type="primary"):
             if not processor_active:
                 subprocess.Popen(
                     [sys.executable, os.path.join(script_dir, "processor.py")],
@@ -232,14 +261,14 @@ with st.sidebar:
             st.rerun()
 
     with col_btn2:
-        if st.button("⏹ Stop Stream", use_container_width=True):
+        if st.button("⏹ Stop Stream", width="stretch"):
             os.system("pkill -f 'processor.py'")
             os.system("pkill -f 'producer.py'")
             st.warning("Stream paused.")
             time.sleep(1)
             st.rerun()
 
-    if st.button("🗑️ Reset Tables to 0", use_container_width=True):
+    if st.button("🗑️ Reset Tables to 0", width="stretch"):
         cur = conn.cursor()
         cur.execute("TRUNCATE TABLE meter_readings RESTART IDENTITY;")
         cur.execute("TRUNCATE TABLE meter_metrics;")

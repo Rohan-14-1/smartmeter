@@ -157,25 +157,42 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+import sqlite3
+import csv
+import threading
+
 # ── Database Connection ───────────────────────────────────────────────
 def get_db():
     db_url = os.environ.get("DATABASE_URL")
     if db_url:
-        if db_url.startswith("postgres://"):
-            db_url = db_url.replace("postgres://", "postgresql://", 1)
-        return psycopg2.connect(db_url)
+        try:
+            if db_url.startswith("postgres://"):
+                db_url = db_url.replace("postgres://", "postgresql://", 1)
+            return psycopg2.connect(db_url), "postgres"
+        except Exception:
+            pass
     
-    DB_CONFIG = dict(
-        host=os.environ.get("DB_HOST", "localhost"),
-        user=os.environ.get("DB_USER", "meter_app"),
-        password=os.environ.get("DB_PASS", "meter_pass"),
-        dbname=os.environ.get("DB_NAME", "smartmeter"),
-        port=os.environ.get("DB_PORT", "5432"),
-    )
-    return psycopg2.connect(**DB_CONFIG)
+    # Try local PostgreSQL
+    try:
+        DB_CONFIG = dict(
+            host=os.environ.get("DB_HOST", "localhost"),
+            user=os.environ.get("DB_USER", "meter_app"),
+            password=os.environ.get("DB_PASS", "meter_pass"),
+            dbname=os.environ.get("DB_NAME", "smartmeter"),
+            port=os.environ.get("DB_PORT", "5432"),
+            connect_timeout=2
+        )
+        return psycopg2.connect(**DB_CONFIG), "postgres"
+    except Exception:
+        # Resilient SQLite fallback (ensures zero crash on Streamlit Cloud)
+        sqlite_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "smartmeter_cloud.db")
+        c = sqlite3.connect(sqlite_path, check_same_thread=False)
+        return c, "sqlite"
 
-try:
-    conn = get_db()
+conn, db_type = get_db()
+
+# Auto-initialize tables
+if db_type == "postgres":
     with conn.cursor() as cur:
         cur.execute("""
             CREATE TABLE IF NOT EXISTS meter_readings (
@@ -196,10 +213,27 @@ try:
             );
         """)
         conn.commit()
-except Exception as err:
-    st.error(f"⚠️ Could not connect to PostgreSQL: {err}")
-    st.info("Check your database connection or configure DATABASE_URL in Render environment variables.")
-    st.stop()
+else:
+    with conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS meter_readings (
+                reading_pk INTEGER PRIMARY KEY AUTOINCREMENT,
+                reading_time TEXT,
+                global_active_power REAL,
+                rolling_avg_30 REAL,
+                is_anomaly INTEGER DEFAULT 0
+            );
+        """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS meter_metrics (
+                id INTEGER PRIMARY KEY,
+                current_power REAL,
+                rolling_avg REAL,
+                peak_power REAL,
+                total_kwh REAL,
+                anomaly_count INTEGER
+            );
+        """)
 
 # ── Check Pipeline Process Status ─────────────────────────────────────
 def is_process_running(script_name: str) -> bool:
@@ -209,8 +243,57 @@ def is_process_running(script_name: str) -> bool:
     except Exception:
         return False
 
-processor_active = is_process_running("processor.py")
-producer_active = is_process_running("producer.py")
+# Global stream flag for cloud mode
+if "cloud_stream_active" not in st.session_state:
+    st.session_state["cloud_stream_active"] = False
+
+processor_active = is_process_running("processor.py") or st.session_state.get("cloud_stream_active", False)
+producer_active = is_process_running("producer.py") or st.session_state.get("cloud_stream_active", False)
+
+def run_cloud_streamer():
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    csv_file = os.path.join(base_dir, "data.csv")
+    if not os.path.exists(csv_file):
+        csv_file = os.path.join(base_dir, "data_sample.csv")
+    if not os.path.exists(csv_file):
+        return
+
+    model_path = os.path.join(base_dir, "anomaly_model.pkl")
+    model = joblib.load(model_path) if os.path.exists(model_path) else None
+
+    from collections import deque
+    window = deque(maxlen=30)
+    peak, total_kwh, anomaly_count = 0.0, 0.0, 0
+
+    c_stream, d_type = get_db()
+    with open(csv_file) as f:
+        for row in csv.DictReader(f):
+            if not st.session_state.get("cloud_stream_active", False):
+                break
+            try:
+                p = float(row["Global_active_power"])
+            except Exception:
+                continue
+
+            window.append(p)
+            avg = sum(window) / len(window)
+            peak = max(peak, p)
+            total_kwh += p / 60.0
+            is_anom = int(model.predict([[p]])[0] == -1) if model else 0
+            anomaly_count += is_anom
+            t_val = row.get("Date_Time", "2006-12-16 17:24:00")
+
+            if d_type == "postgres":
+                with c_stream.cursor() as cur:
+                    cur.execute("INSERT INTO meter_readings (reading_time, global_active_power, rolling_avg_30, is_anomaly) VALUES (%s,%s,%s,%s)", (t_val, p, round(avg, 3), is_anom))
+                    cur.execute("INSERT INTO meter_metrics VALUES (1,%s,%s,%s,%s,%s) ON CONFLICT (id) DO UPDATE SET current_power=EXCLUDED.current_power, rolling_avg=EXCLUDED.rolling_avg, peak_power=EXCLUDED.peak_power, total_kwh=EXCLUDED.total_kwh, anomaly_count=EXCLUDED.anomaly_count", (p, round(avg, 3), peak, round(total_kwh, 3), anomaly_count))
+                    c_stream.commit()
+            else:
+                with c_stream:
+                    c_stream.execute("INSERT INTO meter_readings (reading_time, global_active_power, rolling_avg_30, is_anomaly) VALUES (?,?,?,?)", (t_val, p, round(avg, 3), is_anom))
+                    c_stream.execute("INSERT OR REPLACE INTO meter_metrics (id, current_power, rolling_avg, peak_power, total_kwh, anomaly_count) VALUES (1,?,?,?,?,?)", (p, round(avg, 3), peak, round(total_kwh, 3), anomaly_count))
+
+            time.sleep(0.12)
 
 # ── Sidebar Controls ──────────────────────────────────────────────────
 with st.sidebar:
@@ -226,7 +309,7 @@ with st.sidebar:
                 </span>
             </div>
             <div style="display:flex; justify-content:space-between; font-size: 0.85rem;">
-                <span style="color:#94a3b8;">Kafka Producer:</span>
+                <span style="color:#94a3b8;">Data Streamer:</span>
                 <span style="color: {'#34d399' if producer_active else '#ef4444'}; font-weight: 600;">
                     {'🟢 Running' if producer_active else '🔴 Stopped'}
                 </span>
@@ -241,27 +324,45 @@ with st.sidebar:
     col_btn1, col_btn2 = st.columns(2)
     with col_btn1:
         if st.button("▶ Start Stream", width="stretch", type="primary"):
-            if not processor_active:
-                subprocess.Popen(
-                    [sys.executable, os.path.join(script_dir, "processor.py")],
-                    cwd=script_dir,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-                time.sleep(0.5)
-            if not producer_active:
-                subprocess.Popen(
-                    [sys.executable, os.path.join(script_dir, "producer.py"), "--delay", "0.08"],
-                    cwd=script_dir,
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
+            # Check if Kafka is reachable
+            import socket
+            kafka_up = False
+            try:
+                s = socket.create_connection(("127.0.0.1", 9092), timeout=0.8)
+                s.close()
+                kafka_up = True
+            except Exception:
+                kafka_up = False
+
+            if kafka_up:
+                if not is_process_running("processor.py"):
+                    subprocess.Popen(
+                        [sys.executable, os.path.join(script_dir, "processor.py")],
+                        cwd=script_dir,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+                    time.sleep(0.5)
+                if not is_process_running("producer.py"):
+                    subprocess.Popen(
+                        [sys.executable, os.path.join(script_dir, "producer.py"), "--delay", "0.08"],
+                        cwd=script_dir,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+            else:
+                # Cloud Streamer thread for Streamlit Cloud
+                st.session_state["cloud_stream_active"] = True
+                t = threading.Thread(target=run_cloud_streamer, daemon=True)
+                t.start()
+
             st.success("Pipeline started!")
             time.sleep(1)
             st.rerun()
 
     with col_btn2:
         if st.button("⏹ Stop Stream", width="stretch"):
+            st.session_state["cloud_stream_active"] = False
             os.system("pkill -f 'processor.py'")
             os.system("pkill -f 'producer.py'")
             st.warning("Stream paused.")
@@ -269,11 +370,15 @@ with st.sidebar:
             st.rerun()
 
     if st.button("🗑️ Reset Tables to 0", width="stretch"):
-        cur = conn.cursor()
-        cur.execute("TRUNCATE TABLE meter_readings RESTART IDENTITY;")
-        cur.execute("TRUNCATE TABLE meter_metrics;")
-        conn.commit()
-        cur.close()
+        if db_type == "postgres":
+            with conn.cursor() as cur:
+                cur.execute("TRUNCATE TABLE meter_readings RESTART IDENTITY;")
+                cur.execute("TRUNCATE TABLE meter_metrics;")
+                conn.commit()
+        else:
+            with conn:
+                conn.execute("DELETE FROM meter_readings;")
+                conn.execute("DELETE FROM meter_metrics;")
         st.info("Database reset to 0.")
         time.sleep(0.5)
         st.rerun()
